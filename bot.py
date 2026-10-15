@@ -53,7 +53,7 @@ from telegram.ext import (
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8463043144:AAEwtgNB1DX3meSPveMvuvs3ZlpbiCSNDgE").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID_RAW = os.getenv("OWNER_ID", "8753914631").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot_data.db").strip()
 
