@@ -1037,18 +1037,45 @@ def is_owner_for(db: Database, user_id: Optional[int], owner_id: int) -> bool:
 # KEYBOARDS
 # ============================================================
 
+# Detect whether this python-telegram-bot build accepts style / icon_custom_emoji_id
+# (added in PTB 22.7 for Bot API 9.4 colored buttons). Older installs must not
+# pass those kwargs or InlineKeyboardButton raises TypeError and /admin crashes.
+try:
+    import inspect as _inspect
+    _IKB_PARAMS = set(_inspect.signature(InlineKeyboardButton.__init__).parameters)
+except Exception:
+    _IKB_PARAMS = set()
+_SUPPORTS_BUTTON_STYLE = "style" in _IKB_PARAMS
+_SUPPORTS_BUTTON_ICON = "icon_custom_emoji_id" in _IKB_PARAMS
+
+if not _SUPPORTS_BUTTON_STYLE:
+    logging.getLogger("multi_bot_manager").warning(
+        "InlineKeyboardButton.style not supported by this python-telegram-bot build. "
+        "Upgrade to python-telegram-bot>=22.7 for colored buttons (primary/success/danger). "
+        "Buttons will work without colors until then."
+    )
+else:
+    logging.getLogger("multi_bot_manager").info(
+        "Button styles enabled (python-telegram-bot supports style=primary|success|danger)."
+    )
+
+
 def _make_inline_button(text: str, url: str, style: Optional[str] = None,
                         icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    kwargs: dict = {"text": text[:64], "url": url, "style": normalize_button_style(style)}
-    if icon_custom_emoji_id:
+    kwargs: dict = {"text": text[:64], "url": url}
+    if _SUPPORTS_BUTTON_STYLE:
+        kwargs["style"] = normalize_button_style(style)
+    if _SUPPORTS_BUTTON_ICON and icon_custom_emoji_id:
         kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
     return InlineKeyboardButton(**kwargs)
 
 
 def _make_callback_button(text: str, callback_data: str, style: Optional[str] = None,
                           icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    kwargs: dict = {"text": text[:64], "callback_data": callback_data, "style": normalize_button_style(style)}
-    if icon_custom_emoji_id:
+    kwargs: dict = {"text": text[:64], "callback_data": callback_data}
+    if _SUPPORTS_BUTTON_STYLE:
+        kwargs["style"] = normalize_button_style(style)
+    if _SUPPORTS_BUTTON_ICON and icon_custom_emoji_id:
         kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
     return InlineKeyboardButton(**kwargs)
 
