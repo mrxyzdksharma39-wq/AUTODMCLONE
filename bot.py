@@ -96,9 +96,22 @@ except (TypeError, ValueError):
     HEALTH_PORT = RENDER_PORT
 
 MAX_RETRIES = 3
-# Telegram global broadcast guidance is approximately 30 messages/second.
-BROADCAST_DELAY = 0.04
-BROADCAST_CONCURRENCY = max(1, min(8, int(os.getenv("BROADCAST_CONCURRENCY", "5"))))
+def _env_number(name: str, default: float, low: float, high: float, as_int: bool = False):
+    """Read a numeric env var safely; bad values never crash startup."""
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = float(default)
+    value = max(low, min(high, value))
+    return int(value) if as_int else value
+
+
+# Telegram allows ~30 messages/second per bot for broadcasts. 28/s keeps a safety
+# margin; the limiter slows down automatically if Telegram still sends 429s.
+BROADCAST_RATE = _env_number("BROADCAST_RATE", 28.0, 5.0, 30.0)
+BROADCAST_WORKERS = _env_number("BROADCAST_WORKERS", 24, 1, 64, as_int=True)
+BROADCAST_PROGRESS_INTERVAL = _env_number("BROADCAST_PROGRESS_INTERVAL", 3.0, 1.5, 30.0)
+BROADCAST_MAX_RESTARTS = 3
 JOIN_REQUEST_ACTION_DELAY = 0.08
 MAX_BUTTONS = 100
 MAX_TEXT_LENGTH = 4096
@@ -3339,122 +3352,305 @@ class BotInstance:
         context.user_data.pop("pending_broadcast_buttons", None)
         context.user_data.pop("button_target", None)
         context.user_data.pop("awaiting", None)
-        await message.reply_text(f"📢 Broadcast #{broadcast_id} started.")
-        task = self.application.create_task(self.run_broadcast(broadcast_id))
+        # This message becomes the LIVE dashboard: it is edited in place while the
+        # broadcast runs and turns into the final report at the end. The bot that
+        # owns the message (child OR main) is the one that edits it.
+        progress_target = None
+        try:
+            try:
+                progress_bot = message.get_bot()
+            except Exception:
+                progress_bot = self.application.bot
+            started_msg = await message.reply_text(
+                _render_broadcast_live(broadcast_id, 0, 0, 0, 0, 0.0, 0.0, 0.0, starting=True)
+            )
+            progress_target = (progress_bot, started_msg.chat_id, started_msg.message_id)
+        except Exception as exc:
+            logger.warning("Could not create broadcast live message (broadcast_id=%s): %s",
+                           broadcast_id, clean_error(exc))
+        task = self.application.create_task(self.run_broadcast(broadcast_id, progress_target))
         self.broadcast_tasks.add(task)
         task.add_done_callback(self.broadcast_tasks.discard)
 
-    async def run_broadcast(self, broadcast_id: int):
-        """Resumable, per-recipient checkpointed broadcaster with bounded concurrency."""
-        semaphore = asyncio.Semaphore(BROADCAST_CONCURRENCY)
-        rate_lock = asyncio.Lock()
-        last_send = [0.0]
-        started_monotonic = asyncio.get_running_loop().time()
+    async def run_broadcast(self, broadcast_id: int, progress_target=None):
+        """Supervisor: runs the broadcaster and transparently restarts (resuming from
+        the per-recipient log) if it ever crashes unexpectedly."""
+        loop = asyncio.get_running_loop()
+        ctx = {"target": progress_target, "t0": loop.time()}
+        for attempt in range(1, BROADCAST_MAX_RESTARTS + 1):
+            try:
+                outcome = await self._run_broadcast_once(broadcast_id, ctx)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                outcome = "crashed"
+                logger.exception("Broadcast supervisor caught crash (bot_id=%s broadcast_id=%s)", self.bot_id, broadcast_id)
+                try:
+                    self.db.log_error("EXCEPTION", "broadcast", f"worker id={broadcast_id}", clean_error(exc))
+                except Exception:
+                    pass
+            if outcome != "crashed":
+                return
+            try:
+                self.db.execute("UPDATE broadcasts SET status='running' WHERE id=? AND status IN ('running','paused')",
+                                (broadcast_id,), commit=True)
+            except Exception:
+                pass
+            if attempt < BROADCAST_MAX_RESTARTS:
+                await asyncio.sleep(3 * attempt)
+        try:
+            self.db.execute("UPDATE broadcasts SET status='paused' WHERE id=? AND status='running'", (broadcast_id,), commit=True)
+        except Exception:
+            pass
+
+    async def _run_broadcast_once(self, broadcast_id: int, ctx: dict) -> str:
+        """One pass: bounded worker pool + token-bucket limiter + batched DB writes +
+        live dashboard. Returns 'done', 'stopped' or 'crashed'. Resumable."""
+        loop = asyncio.get_running_loop()
+        t0 = ctx["t0"]
+        bot = self.application.bot
+        stop = asyncio.Event()
+        gate = _BroadcastRateGate(BROADCAST_RATE)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=BROADCAST_WORKERS * 4)
+        cnt = {"sent": 0, "failed": 0, "blocked": 0, "skipped": 0}
+        pending_rows: list = []
+        newly_blocked: list = []
+        state = {"run_done": 0, "total": 0, "block_until": 0.0, "edit_fails": 0, "ui_dead": False}
+        samples: list = []
+        tasks: list = []
+        row = None
+        flush = lambda: None  # replaced below once state exists
         try:
             row = self.db.fetchone("SELECT * FROM broadcasts WHERE id=?", (broadcast_id,))
             if not row:
                 logger.error("Broadcast row missing (bot_id=%s broadcast_id=%s)", self.bot_id, broadcast_id)
-                return
+                return "done"
             self.db.execute("UPDATE broadcasts SET status='running', started_at=COALESCE(started_at,?) WHERE id=? AND status IN ('running','paused','pending')", (utc_now(), broadcast_id), commit=True)
-            # Snapshot eligible recipients at start. Unknown statuses remain eligible;
-            # only confirmed-blocked users are excluded.
             total_row = self.db.fetchone("SELECT COUNT(*) AS c FROM users WHERE block_status!='blocked' AND is_bot=0")
-            total = int(total_row['c']) if total_row else 0
-            self.db.execute("UPDATE broadcasts SET total=? WHERE id=?", (total, broadcast_id), commit=True)
-            cursor_id = 0
-            while True:
-                batch = self.db.fetchall("SELECT user_id FROM users WHERE user_id>? AND block_status!='blocked' AND is_bot=0 ORDER BY user_id LIMIT 250", (cursor_id,))
-                if not batch:
-                    break
-                cursor_id = int(batch[-1]['user_id'])
-                async def process(item):
-                    uid = int(item['user_id'])
-                    existing = self.db.fetchone("SELECT status FROM broadcast_logs WHERE broadcast_id=? AND user_id=?", (broadcast_id, uid))
-                    if existing and existing['status'] in ('sent','blocked','failed','skipped'):
-                        return
-                    status, error = 'failed', None
-                    async with semaphore:
-                        for attempt in range(MAX_RETRIES):
-                            try:
-                                async with rate_lock:
-                                    loop = asyncio.get_running_loop()
-                                    delay = BROADCAST_DELAY - (loop.time() - last_send[0])
-                                    if delay > 0:
-                                        await asyncio.sleep(delay)
-                                    last_send[0] = loop.time()
-                                await send_broadcast_to_user(self.application.bot, row, uid)
-                                status, error = 'sent', None
-                                break
-                            except RetryAfter as exc:
-                                wait = getattr(exc, 'retry_after', 1)
-                                try: wait = float(wait)
-                                except (TypeError, ValueError): wait = 1.0
-                                await asyncio.sleep(min(max(wait, 1.0), 120.0) + 0.25)
-                                error = clean_error(exc)
-                            except Forbidden as exc:
-                                error = clean_error(exc)
-                                low = error.lower()
-                                if any(term in low for term in ('bot was blocked', 'blocked by the user', 'user is deactivated', 'chat not found')):
-                                    status = 'blocked'
-                                    self.db.execute("UPDATE users SET is_blocked=1, block_status='blocked' WHERE user_id=?", (uid,), commit=False)
-                                else:
-                                    status = 'failed'
-                                break
-                            except (NetworkError, TimedOut) as exc:
-                                error = clean_error(exc)
-                                if attempt + 1 < MAX_RETRIES:
-                                    await asyncio.sleep(min(2 ** attempt, 8) + (secrets.randbelow(500) / 1000))
-                            except BadRequest as exc:
-                                status, error = 'failed', clean_error(exc)
-                                break
-                            except TelegramError as exc:
-                                status, error = 'failed', clean_error(exc)
-                                break
-                            except Exception as exc:
-                                status, error = 'failed', clean_error(exc)
-                                logger.exception("Broadcast recipient failed (bot_id=%s broadcast_id=%s user_id=%s)", self.bot_id, broadcast_id, uid)
-                                break
-                    self.db.execute("""INSERT INTO broadcast_logs(broadcast_id,user_id,status,error,created_at) VALUES(?,?,?,?,?)
-                        ON CONFLICT(broadcast_id,user_id) DO UPDATE SET status=excluded.status,error=excluded.error,created_at=excluded.created_at""",
-                        (broadcast_id, uid, status, error, utc_now()), commit=True)
-                    counts = self.db.fetchall("SELECT status,COUNT(*) AS c FROM broadcast_logs WHERE broadcast_id=? GROUP BY status", (broadcast_id,))
-                    c = {r['status']: int(r['c']) for r in counts}
-                    self.db.execute("UPDATE broadcasts SET sent=?,failed=?,blocked=? WHERE id=?",
-                        (c.get('sent',0), c.get('failed',0), c.get('blocked',0), broadcast_id), commit=True)
-                await asyncio.gather(*(process(item) for item in batch))
-                state = self.db.fetchone("SELECT status FROM broadcasts WHERE id=?", (broadcast_id,))
-                if state and state['status'] in ('cancelled','paused'):
-                    return
-            counts = self.db.fetchall("SELECT status,COUNT(*) AS c FROM broadcast_logs WHERE broadcast_id=? GROUP BY status", (broadcast_id,))
-            c = {r['status']: int(r['c']) for r in counts}
-            processed = sum(c.values())
-            final_status = 'completed' if processed >= total else 'paused'
-            self.db.execute("UPDATE broadcasts SET status=?,sent=?,failed=?,blocked=?,next_user_id=NULL,finished_at=? WHERE id=?",
-                (final_status,c.get('sent',0),c.get('failed',0),c.get('blocked',0),utc_now(),broadcast_id), commit=True)
-            self.db.log_event('broadcast_completed' if final_status == 'completed' else 'broadcast_paused',
-                details=f"id={broadcast_id};total={total};processed={processed};sent={c.get('sent',0)};failed={c.get('failed',0)};blocked={c.get('blocked',0)};elapsed={asyncio.get_running_loop().time()-started_monotonic:.1f}s")
-            # ── Notify admin of broadcast result ─────────────────────────────
-            not_attempted = max(0, total - processed)
-            status_icon = "📣" if final_status == 'completed' else "⏸"
-            status_label = "completed" if final_status == 'completed' else "paused"
-            completion_text = (
-                f"{status_icon} Broadcast #{broadcast_id} {status_label}\n\n"
-                f"Total: {total}\n"
-                f"✅ Success: {c.get('sent', 0)}\n"
-                f"❌ Failed: {c.get('failed', 0) + c.get('blocked', 0)}\n"
-                f"Not attempted: {not_attempted}"
-            )
+            state["total"] = int(total_row['c']) if total_row else 0
+
+            # Resume state: everything already logged is skipped.
+            done_ids = set()
+            for r in self.db.fetchall("SELECT user_id,status FROM broadcast_logs WHERE broadcast_id=?", (broadcast_id,)):
+                if r['status'] in ('sent', 'blocked', 'failed', 'skipped'):
+                    done_ids.add(int(r['user_id']))
+                    cnt[r['status']] = cnt.get(r['status'], 0) + 1
+            # On resume keep the ORIGINAL total (users blocked during the first pass are
+            # no longer counted by the live query); never let it drop below what is logged.
             try:
-                await self.application.bot.send_message(
-                    chat_id=self.owner_id,
-                    text=completion_text,
-                )
-            except Exception as _notify_exc:
-                logger.warning(
-                    "Could not notify owner of broadcast completion (bot_id=%s broadcast_id=%s): %s",
-                    self.bot_id, broadcast_id, _notify_exc,
-                )
-            # ─────────────────────────────────────────────────────────────────
+                prev_total = int(row['total'] or 0)
+            except (KeyError, TypeError, ValueError, IndexError):
+                prev_total = 0
+            if done_ids and prev_total > 0:
+                state["total"] = prev_total
+            state["total"] = max(state["total"], sum(cnt.values()))
+            self.db.execute("UPDATE broadcasts SET total=? WHERE id=?", (state["total"], broadcast_id), commit=True)
+
+            # Resumed after restart (no message to edit yet): create a fresh live message.
+            if ctx.get("target") is None and self.owner_id:
+                try:
+                    m = await bot.send_message(chat_id=self.owner_id,
+                                               text=_render_broadcast_live(broadcast_id, state["total"], cnt["sent"], cnt["failed"], cnt["blocked"], 0.0, 0.0, 0.0, starting=True))
+                    ctx["target"] = (bot, m.chat_id, m.message_id)
+                except Exception as exc:
+                    logger.warning("Could not create live message (broadcast_id=%s): %s", broadcast_id, clean_error(exc))
+
+            # ---------- helpers ----------
+            def record(uid, status, error):
+                cnt[status] = cnt.get(status, 0) + 1
+                state["run_done"] += 1
+                pending_rows.append((broadcast_id, uid, status, (error or None) and str(error)[:500], utc_now()))
+                if status == 'blocked':
+                    newly_blocked.append(uid)
+
+            def flush():
+                if not pending_rows and not newly_blocked:
+                    return
+                rows, blocked_ids = pending_rows[:], newly_blocked[:]
+                del pending_rows[:]
+                del newly_blocked[:]
+                try:
+                    self.db.executemany(
+                        """INSERT INTO broadcast_logs(broadcast_id,user_id,status,error,created_at) VALUES(?,?,?,?,?)
+                           ON CONFLICT(broadcast_id,user_id) DO UPDATE SET status=excluded.status,error=excluded.error,created_at=excluded.created_at""",
+                        rows)
+                    if blocked_ids:
+                        self.db.executemany("UPDATE users SET is_blocked=1, block_status='blocked' WHERE user_id=?",
+                                            [(u,) for u in blocked_ids])
+                    self.db.execute("UPDATE broadcasts SET sent=?,failed=?,blocked=? WHERE id=?",
+                                    (cnt['sent'], cnt['failed'], cnt['blocked'], broadcast_id), commit=True)
+                except Exception as exc:
+                    try:
+                        self.db.conn.rollback()
+                    except Exception:
+                        pass
+                    pending_rows[:0] = rows
+                    newly_blocked[:0] = blocked_ids
+                    logger.warning("Broadcast log flush failed, will retry (broadcast_id=%s): %s", broadcast_id, clean_error(exc))
+
+            def speeds():
+                now = loop.time()
+                elapsed = max(0.001, now - t0)
+                avg = state["run_done"] / elapsed
+                samples.append((now, state["run_done"]))
+                while len(samples) > 4:
+                    samples.pop(0)
+                a, b = samples[0], samples[-1]
+                cur = (b[1] - a[1]) / (b[0] - a[0]) if b[0] - a[0] > 0.2 else avg
+                return cur, avg, elapsed
+
+            async def edit_ui(text) -> bool:
+                target = ctx.get("target")
+                if not target or state["ui_dead"] or loop.time() < state["block_until"]:
+                    return False
+                p_bot, chat_id, msg_id = target
+                try:
+                    await p_bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+                    state["edit_fails"] = 0
+                    return True
+                except RetryAfter as exc:
+                    state["block_until"] = loop.time() + _retry_seconds(exc) + 1.0
+                    return False
+                except BadRequest as exc:
+                    if 'not modified' in str(exc).lower():
+                        return True
+                    state["edit_fails"] += 1
+                except Exception:
+                    state["edit_fails"] += 1
+                if state["edit_fails"] >= 5:
+                    state["ui_dead"] = True
+                return False
+
+            async def reporter():
+                while True:
+                    await asyncio.sleep(BROADCAST_PROGRESS_INTERVAL)
+                    try:
+                        flush()
+                        st = self.db.fetchone("SELECT status FROM broadcasts WHERE id=?", (broadcast_id,))
+                        if st and st['status'] in ('cancelled', 'paused'):
+                            stop.set()
+                        gate.recover()
+                        cur, avg, elapsed = speeds()
+                        await edit_ui(_render_broadcast_live(broadcast_id, state["total"], cnt['sent'], cnt['failed'], cnt['blocked'], cur, avg, elapsed, rate_note=gate.note()))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Broadcast reporter error (broadcast_id=%s)", broadcast_id)
+
+            async def send_one(uid):
+                net_tries = flood_tries = 0
+                error = None
+                while True:
+                    if stop.is_set():
+                        return None, None
+                    await gate.wait()
+                    try:
+                        await asyncio.wait_for(send_broadcast_to_user(bot, row, uid), timeout=60)
+                        return 'sent', None
+                    except RetryAfter as exc:
+                        error = clean_error(exc)
+                        gate.penalize(_retry_seconds(exc))
+                        flood_tries += 1
+                        if flood_tries >= 12:
+                            return 'failed', error
+                    except Forbidden as exc:
+                        error = clean_error(exc)
+                        low = error.lower()
+                        if any(t in low for t in ('bot was blocked', 'blocked by the user', 'user is deactivated', 'chat not found')):
+                            return 'blocked', error
+                        return 'failed', error
+                    except BadRequest as exc:
+                        return 'failed', clean_error(exc)
+                    except (NetworkError, TimedOut, asyncio.TimeoutError) as exc:
+                        error = clean_error(exc) if isinstance(exc, Exception) else 'timeout'
+                        net_tries += 1
+                        if net_tries >= MAX_RETRIES:
+                            return 'failed', error
+                        await asyncio.sleep(min(2 ** (net_tries - 1), 8) + (secrets.randbelow(500) / 1000))
+                    except TelegramError as exc:
+                        return 'failed', clean_error(exc)
+                    except Exception as exc:
+                        logger.exception("Broadcast recipient failed (bot_id=%s broadcast_id=%s user_id=%s)", self.bot_id, broadcast_id, uid)
+                        return 'failed', clean_error(exc)
+
+            async def worker():
+                while True:
+                    uid = await queue.get()
+                    if uid is None:
+                        return
+                    if stop.is_set():
+                        continue
+                    try:
+                        status, error = await send_one(uid)
+                        if status:
+                            record(uid, status, error)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.exception("Broadcast worker item error (broadcast_id=%s user_id=%s)", broadcast_id, uid)
+                        record(uid, 'failed', clean_error(exc))
+
+            async def producer():
+                err = None
+                try:
+                    cursor_id = 0
+                    while not stop.is_set():
+                        batch = self.db.fetchall("SELECT user_id FROM users WHERE user_id>? AND block_status!='blocked' AND is_bot=0 ORDER BY user_id LIMIT 1000", (cursor_id,))
+                        if not batch:
+                            break
+                        cursor_id = int(batch[-1]['user_id'])
+                        for item in batch:
+                            uid = int(item['user_id'])
+                            if uid in done_ids:
+                                continue
+                            await queue.put(uid)
+                except asyncio.CancelledError:
+                    raise  # workers are cancelled too; never block on the queue here
+                except Exception as exc:
+                    err = exc
+                # Normal end / stop / producer error: workers are alive, release them.
+                for _ in range(BROADCAST_WORKERS):
+                    await queue.put(None)
+                if err is not None:
+                    raise err
+
+            # ---------- run ----------
+            reporter_task = asyncio.create_task(reporter())
+            producer_task = asyncio.create_task(producer())
+            worker_tasks = [asyncio.create_task(worker()) for _ in range(BROADCAST_WORKERS)]
+            tasks = [reporter_task, producer_task, *worker_tasks]
+            results = await asyncio.gather(producer_task, *worker_tasks, return_exceptions=True)
+            reporter_task.cancel()
+            for res in results:
+                if isinstance(res, asyncio.CancelledError):
+                    raise res
+                if isinstance(res, BaseException):
+                    raise res
+            flush()
+            state_row = self.db.fetchone("SELECT status FROM broadcasts WHERE id=?", (broadcast_id,))
+            stopped = stop.is_set() or bool(state_row and state_row['status'] in ('cancelled', 'paused'))
+            final_status = 'paused' if stopped else 'completed'
+            processed = sum(cnt.values())
+            _, avg, elapsed = speeds()
+            self.db.execute("UPDATE broadcasts SET status=?,sent=?,failed=?,blocked=?,next_user_id=NULL,finished_at=? WHERE id=? AND status!='cancelled'",
+                            (final_status, cnt['sent'], cnt['failed'], cnt['blocked'], utc_now(), broadcast_id), commit=True)
+            try:
+                self.db.log_event('broadcast_completed' if final_status == 'completed' else 'broadcast_paused',
+                                  details=f"id={broadcast_id};total={state['total']};processed={processed};sent={cnt['sent']};failed={cnt['failed']};blocked={cnt['blocked']};elapsed={elapsed:.1f}s;avg={avg:.1f}/s")
+            except Exception:
+                pass
+
+            # ---- final report replaces the live message ----
+            final_text = _render_broadcast_final(broadcast_id, final_status, state["total"], cnt['sent'], cnt['failed'] + cnt['blocked'], processed, elapsed, avg)
+            state["ui_dead"] = False
+            state["block_until"] = 0.0
+            if not await edit_ui(final_text):
+                try:
+                    await bot.send_message(chat_id=self.owner_id, text=final_text)
+                except Exception as _notify_exc:
+                    logger.warning("Could not notify owner of broadcast result (bot_id=%s broadcast_id=%s): %s",
+                                   self.bot_id, broadcast_id, _notify_exc)
+
             staged = row['staged_media_path'] if 'staged_media_path' in row.keys() else ''
             if final_status == 'completed' and staged:
                 try:
@@ -3462,13 +3658,33 @@ class BotInstance:
                     self.db.execute("UPDATE broadcasts SET staged_media_path=NULL WHERE id=?", (broadcast_id,), commit=True)
                 except OSError:
                     logger.warning("Could not remove staged media (broadcast_id=%s)", broadcast_id)
+            return "stopped" if stopped else "done"
         except asyncio.CancelledError:
+            try:
+                flush()
+            except Exception:
+                pass
             self.db.execute("UPDATE broadcasts SET status='paused' WHERE id=? AND status='running'", (broadcast_id,), commit=True)
             raise
         except Exception as exc:
             logger.exception("Broadcast worker crashed (bot_id=%s broadcast_id=%s)", self.bot_id, broadcast_id)
-            self.db.execute("UPDATE broadcasts SET status='paused' WHERE id=? AND status='running'", (broadcast_id,), commit=True)
-            self.db.log_error("EXCEPTION", "broadcast", f"worker id={broadcast_id}", clean_error(exc))
+            try:
+                self.db.log_error("EXCEPTION", "broadcast", f"worker id={broadcast_id}", clean_error(exc))
+            except Exception:
+                pass
+            return "crashed"
+        finally:
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                try:
+                    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10)
+                except Exception:
+                    pass
+            try:
+                flush()
+            except Exception:
+                pass
 
     # ============================================================
     # BACKUP / DISASTER RECOVERY
@@ -3809,6 +4025,122 @@ def _format_interval_label(seconds: int) -> str:
 
 
 # ============================================================
+# BROADCAST HELPERS  (rate limiter + live dashboard rendering)
+# ============================================================
+
+def _retry_seconds(exc) -> float:
+    """RetryAfter.retry_after may be int/float/timedelta depending on PTB version."""
+    wait = getattr(exc, "retry_after", 1)
+    try:
+        wait = wait.total_seconds()
+    except AttributeError:
+        pass
+    try:
+        wait = float(wait)
+    except (TypeError, ValueError):
+        wait = 1.0
+    return min(max(wait, 1.0), 120.0) + 0.25
+
+
+class _BroadcastRateGate:
+    """Shared token-bucket style limiter. All workers reserve send slots from one
+    clock, so total throughput never exceeds `rate` msg/s. A 429 from Telegram pauses
+    EVERY worker (not just one) and temporarily lowers the rate, then it recovers."""
+
+    def __init__(self, rate: float):
+        self.base_interval = 1.0 / max(1.0, rate)
+        self.interval = self.base_interval
+        self._next = 0.0
+        self.pause_until = 0.0
+        self._last_penalty = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            async with self._lock:
+                now = loop.time()
+                slot = max(now, self._next, self.pause_until)
+                self._next = slot + self.interval
+            delay = slot - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if loop.time() + 0.001 >= self.pause_until:
+                return
+
+    def penalize(self, seconds: float):
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        self.pause_until = max(self.pause_until, now + seconds)
+        # Slow down ~10% (max 8 msg/s floor) but only once per flood event.
+        if now - self._last_penalty > 2.0:
+            self.interval = min(self.interval * 1.1, 1.0 / 8.0)
+            self._last_penalty = now
+
+    def recover(self):
+        loop = asyncio.get_running_loop()
+        if self.interval > self.base_interval and loop.time() - self._last_penalty > 20.0:
+            self.interval = max(self.base_interval, self.interval * 0.95)
+
+    def note(self) -> str:
+        loop = asyncio.get_running_loop()
+        if loop.time() < self.pause_until:
+            return f"⏸ Telegram flood-wait {max(0, self.pause_until - loop.time()):.0f}s (auto-handled)"
+        return ""
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _render_broadcast_live(broadcast_id, total, sent, failed, blocked, speed_now, speed_avg,
+                           elapsed, starting=False, rate_note="") -> str:
+    processed = sent + failed + blocked
+    remaining = max(0, total - processed)
+    frac = 1.0 if total <= 0 and not starting else (min(1.0, processed / total) if total > 0 else 0.0)
+    filled = int(round(frac * 12))
+    bar = "▓" * filled + "░" * (12 - filled)
+    if starting:
+        return f"📢 Broadcast #{broadcast_id} started.\n\n{bar} 0%\n⏳ Starting..."
+    speed = speed_now if speed_now > 0 else speed_avg
+    eta = _fmt_duration(remaining / speed) if speed > 0 and remaining > 0 else ("00:00" if remaining == 0 else "--:--")
+    failed_all = failed + blocked
+    lines = [
+        f"📢 Broadcast #{broadcast_id} — LIVE",
+        "",
+        f"{bar} {int(frac * 100)}%",
+        "",
+        f"👥 Total: {total}",
+        f"✅ Success: {sent}",
+        f"❌ Failed: {failed_all}" + (f" (🚫 blocked: {blocked})" if blocked else ""),
+        f"⏳ Remaining: {remaining}",
+        "",
+        f"⚡ Speed: {speed_now:.1f} msg/s (avg {speed_avg:.1f})",
+        f"⏱ Elapsed: {_fmt_duration(elapsed)}  |  ETA: {eta}",
+    ]
+    if rate_note:
+        lines += ["", rate_note]
+    return "\n".join(lines)
+
+
+def _render_broadcast_final(broadcast_id, final_status, total, sent, failed_all, processed,
+                            elapsed, avg) -> str:
+    icon = "📣" if final_status == "completed" else "⏸"
+    label = "completed" if final_status == "completed" else "paused"
+    return (
+        f"{icon} Broadcast #{broadcast_id} {label}\n\n"
+        f"Total: {total}\n"
+        f"✅ Success: {sent}\n"
+        f"❌ Failed: {failed_all}\n"
+        f"Not attempted: {max(0, total - processed)}\n\n"
+        f"⏱ Time: {_fmt_duration(elapsed)}  |  ⚡ Avg speed: {avg:.1f} msg/s"
+    )
+
+
+# ============================================================
 # SEND BROADCAST TO USER  (module-level; reads row only)
 # ============================================================
 
@@ -3827,6 +4159,10 @@ async def send_broadcast_to_user(bot, row, user_id: int):
                 chat_id=user_id, from_chat_id=source_chat,
                 message_id=source_msg, reply_markup=keyboard,
             )
+        except (RetryAfter, Forbidden, NetworkError, TimedOut):
+            # Let the broadcaster handle flood-wait / blocked / network errors.
+            # Falling through would double the API calls for the same user.
+            raise
         except TelegramError as copy_exc:
             logger.warning(
                 "Broadcast copy_message fallback for user %s: %s",
