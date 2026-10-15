@@ -1039,7 +1039,9 @@ def is_owner_for(db: Database, user_id: Optional[int], owner_id: int) -> bool:
 
 def _make_inline_button(text: str, url: str, style: Optional[str] = None,
                         icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    kwargs = {"text": text[:64], "url": url, "style": normalize_button_style(style)}
+    # `style` is an internal visual hint only — strip it before passing to PTB.
+    _style = normalize_button_style(style)  # noqa: F841
+    kwargs: dict = {"text": text[:64], "url": url}
     if icon_custom_emoji_id:
         kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
     return InlineKeyboardButton(**kwargs)
@@ -1047,7 +1049,10 @@ def _make_inline_button(text: str, url: str, style: Optional[str] = None,
 
 def _make_callback_button(text: str, callback_data: str, style: Optional[str] = None,
                           icon_custom_emoji_id: Optional[str] = None) -> InlineKeyboardButton:
-    kwargs = {"text": text[:64], "callback_data": callback_data, "style": normalize_button_style(style)}
+    # `style` is an internal visual hint only — InlineKeyboardButton has no such param.
+    # Normalize and discard it; never pass it to PTB.
+    _style = normalize_button_style(style)  # noqa: F841 — kept for future use
+    kwargs: dict = {"text": text[:64], "callback_data": callback_data}
     if icon_custom_emoji_id:
         kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
     return InlineKeyboardButton(**kwargs)
